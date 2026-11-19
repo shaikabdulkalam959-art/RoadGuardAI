@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import tempfile
 from collections import Counter
 from io import BytesIO
 from pathlib import Path
-import tempfile
 from typing import Any
 
 import streamlit as st
-
 
 st.set_page_config(
     page_title="RoadGuard AI",
@@ -17,59 +16,44 @@ st.set_page_config(
 )
 
 
-@st.cache_resource(show_spinner="Loading the object detection model...")
+@st.cache_resource(show_spinner="Loading YOLO model...")
 def load_model(model_name: str) -> Any:
-    """Load and cache an Ultralytics YOLO model the first time it is needed."""
     from ultralytics import YOLO
-
     return YOLO(model_name)
 
 
-def summarize_result(result: Any) -> Counter[str]:
-    """Count the detected classes in one Ultralytics result."""
+def summarize_result(result: Any) -> Counter:
+    if result.boxes is None:
+        return Counter()
     names = result.names
-    class_ids = result.boxes.cls.tolist() if result.boxes is not None else []
-    return Counter(str(names[int(class_id)]) for class_id in class_ids)
-
-
-def show_summary(counts: Counter[str], heading: str) -> None:
-    st.subheader(heading)
-    if not counts:
-        st.info("No supported objects were detected.")
-        return
-
-    st.bar_chart(dict(counts))
-    st.dataframe(
-        [{"Class": name, "Detections": count} for name, count in counts.most_common()],
-        hide_index=True,
-        width="stretch",
-    )
-    csv = "class,detections\n" + "".join(
-        f"{name},{count}\n" for name, count in counts.most_common()
-    )
-    st.download_button(
-        "Download detection counts",
-        data=csv,
-        file_name="roadguard-detections.csv",
-        mime="text/csv",
-    )
+    counts = Counter()
+    for box in result.boxes:
+        class_id = int(box.cls.item())
+        name = names[class_id] if isinstance(names, dict) else str(names[class_id])
+        counts[name] += 1
+    return counts
 
 
 def analyze_image(image_bytes: bytes, model: Any, confidence: float) -> None:
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
     import numpy as np
 
-    image = Image.open(BytesIO(image_bytes)).convert("RGB")
-    result = model.predict(np.asarray(image), conf=confidence, verbose=False)[0]
+    try:
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    except UnidentifiedImageError as exc:
+        raise ValueError("The uploaded image is not a valid JPG, PNG, BMP, or WebP file.") from exc
+
+    result = model.predict(
+        np.asarray(image), conf=confidence, imgsz=640, verbose=False
+    )[0]
     annotated = result.plot()[:, :, ::-1].copy()
     counts = summarize_result(result)
 
-    original_column, result_column = st.columns(2)
-    with original_column:
-        st.image(image, caption="Uploaded image", width="stretch")
-    with result_column:
-        st.image(annotated, caption="Detected objects", width="stretch")
-    show_summary(counts, "Detection summary")
+    left, right = st.columns(2)
+    left.image(image, caption="Uploaded image", use_container_width=True)
+    right.image(annotated, caption="Detected objects", use_container_width=True)
+
+    show_results(counts)
 
 
 def analyze_video(
@@ -78,133 +62,156 @@ def analyze_video(
     model: Any,
     confidence: float,
     sample_every: int,
-    max_samples: int,
+    max_frames: int,
 ) -> None:
     import cv2
 
-    extension = Path(file_name).suffix or ".mp4"
-    temp_path: str | None = None
+    suffix = Path(file_name).suffix.lower() or ".mp4"
+    temp_path = None
     capture = None
+
     try:
-        with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as temp_file:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
             temp_file.write(video_bytes)
             temp_path = temp_file.name
 
         capture = cv2.VideoCapture(temp_path)
         if not capture.isOpened():
-            raise ValueError("This video could not be opened. Try an MP4, AVI, or MOV file.")
+            raise ValueError(
+                "This video could not be opened. Use an MP4/H264 or AVI file. "
+                "MOV or MKV files may need to be converted to MP4."
+            )
 
+        fps = float(capture.get(cv2.CAP_PROP_FPS)) or 25.0
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        total_frames = max(1, frame_count)
-        frame_index = 0
-        processed = 0
-        counts: Counter[str] = Counter()
-        preview = None
-        progress = st.progress(0, text="Analyzing sampled video frames...")
+        total_frames = max(frame_count, 1)
 
-        while processed < max_samples:
+        processed = 0
+        frame_index = 0
+        counts = Counter()
+        preview = None
+        progress = st.progress(0.0, text="Analyzing video frames...")
+
+        while processed < max_frames:
             ok, frame = capture.read()
             if not ok:
                 break
-            current_index = frame_index
-            frame_index += 1
-            if current_index % sample_every:
-                continue
 
-            result = model.predict(frame, conf=confidence, verbose=False)[0]
-            counts.update(summarize_result(result))
-            if preview is None or (
-                result.boxes is not None and len(result.boxes) > 0
-            ):
+            if frame_index % sample_every == 0:
+                result = model.predict(
+                    frame,
+                    conf=confidence,
+                    imgsz=640,
+                    verbose=False,
+                )[0]
+                counts.update(summarize_result(result))
                 preview = result.plot()[:, :, ::-1].copy()
+                processed += 1
 
-            processed += 1
-            progress.progress(
-                min(current_index / total_frames, 1.0),
-                text=f"Analyzed {processed} sampled frame(s)...",
-            )
+                progress.progress(
+                    min(frame_index / total_frames, 1.0),
+                    text=f"Analyzed {processed} sampled frame(s)",
+                )
+
+            frame_index += 1
 
         progress.empty()
-        if processed == 0:
-            raise ValueError("No video frames could be read from this file.")
 
-        metrics = st.columns(2)
-        metrics[0].metric("Sampled frames analyzed", processed)
-        metrics[1].metric("Sampling interval", f"Every {sample_every} frame(s)")
+        if processed == 0:
+            raise ValueError("No readable frames were found in this video.")
+
+        duration = frame_index / fps
+        metrics = st.columns(3)
+        metrics[0].metric("Frames sampled", processed)
+        metrics[1].metric("Video duration", f"{duration:.1f} sec")
+        metrics[2].metric("Sample interval", f"{sample_every} frame(s)")
+
         if preview is not None:
-            st.image(preview, caption="Annotated sampled frame", width="stretch")
-        show_summary(counts, "Detections across sampled frames")
+            st.image(preview, caption="Latest annotated sampled frame", use_container_width=True)
+
+        show_results(counts)
+
     finally:
         if capture is not None:
             capture.release()
-        if temp_path is not None:
+        if temp_path:
             Path(temp_path).unlink(missing_ok=True)
+
+
+def show_results(counts: Counter) -> None:
+    st.subheader("Detection summary")
+    if not counts:
+        st.info("No objects were detected at the selected confidence.")
+        return
+
+    chart_data = dict(counts)
+    st.bar_chart(chart_data)
+    rows = [{"Class": name, "Detections": count} for name, count in counts.most_common()]
+    st.dataframe(rows, hide_index=True, use_container_width=True)
+
+    csv = "class,detections\n" + "".join(
+        f"{name},{count}\n" for name, count in counts.most_common()
+    )
+    st.download_button(
+        "Download detection counts",
+        csv,
+        file_name="roadguard-detections.csv",
+        mime="text/csv",
+    )
 
 
 def main() -> None:
     st.title("RoadGuard AI")
-    st.caption("Road-scene object detection for uploaded images and videos.")
+    st.caption("Road-scene object detection for uploaded images and videos")
 
     with st.sidebar:
         st.header("Analysis settings")
-        analysis_type = st.radio("Input type", ["Image", "Video"])
-        model_name = st.text_input(
-            "YOLO model or weights path",
-            value="yolov8n.pt",
-            help="The default model weights download automatically the first time you analyze a file.",
-        )
-        confidence = st.slider("Detection confidence", 0.1, 0.9, 0.35, 0.05)
-        if analysis_type == "Video":
-            sample_every = st.slider(
-                "Analyze every Nth frame", min_value=1, max_value=60, value=10
-            )
-            max_samples = st.slider(
-                "Maximum sampled frames", min_value=1, max_value=300, value=60
-            )
+        input_type = st.radio("Input type", ["Image", "Video"])
+        model_name = st.text_input("YOLO model or weights path", "yolov8n.pt")
+        confidence = st.slider("Detection confidence", 0.10, 0.90, 0.35, 0.05)
 
-    if analysis_type == "Image":
-        uploaded_file = st.file_uploader(
-            "Upload a road-scene image",
-            type=["jpg", "jpeg", "png", "bmp", "webp"],
-        )
-    else:
-        uploaded_file = st.file_uploader(
-            "Upload a road-scene video",
-            type=["mp4", "avi", "mov", "mkv"],
-        )
+        if input_type == "Video":
+            sample_every = st.slider("Analyze every Nth frame", 1, 60, 10)
+            max_frames = st.slider("Maximum sampled frames", 1, 300, 60)
 
-    st.info(
-        "This app reports objects recognized by a general-purpose YOLO model. "
-        "It is not a validated collision-risk predictor or a substitute for safe driving."
+    uploaded = st.file_uploader(
+        "Upload a road-scene image" if input_type == "Image" else "Upload a road-scene video",
+        type=["jpg", "jpeg", "png", "bmp", "webp"] if input_type == "Image"
+        else ["mp4", "avi", "mov", "mkv"],
     )
 
-    if uploaded_file is None:
-        st.write("Choose an input file to get started.")
+    st.info(
+        "This app uses a general-purpose YOLO model. It does not provide a "
+        "validated collision-risk prediction or replace safe-driving judgment."
+    )
+
+    if uploaded is None:
+        st.write("Choose an image or video to begin.")
         return
 
     if not model_name.strip():
-        st.error("Enter a model name or a valid path to YOLO weights.")
+        st.error("Enter a model name or a local weights path.")
         return
 
     if st.button("Analyze", type="primary"):
         try:
             model = load_model(model_name.strip())
-            if analysis_type == "Image":
-                analyze_image(uploaded_file.getvalue(), model, confidence)
+            if input_type == "Image":
+                analyze_image(uploaded.getvalue(), model, confidence)
             else:
                 analyze_video(
-                    uploaded_file.getvalue(),
-                    uploaded_file.name,
+                    uploaded.getvalue(),
+                    uploaded.name,
                     model,
                     confidence,
                     sample_every,
-                    max_samples,
+                    max_frames,
                 )
-        except Exception as error:
-            st.error(f"Analysis failed: {error}")
+        except Exception as exc:
+            st.error(f"Analysis failed: {exc}")
             st.caption(
-                "Check that the model weights are available and that the uploaded file "
-                "is valid. The default YOLO weights require internet access on first use."
+                "Try an MP4 (H264) video or JPG/PNG image, and wait for model weights "
+                "to finish downloading the first time."
             )
 
 
